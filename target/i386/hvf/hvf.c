@@ -385,10 +385,19 @@ static void hvf_cpu_x86_cpuid(CPUX86State *env, uint32_t index, uint32_t count,
         return;
     }
 
+    uint32_t signature[3];
+    memcpy(signature, "KVMKVMKVM\0\0\0", 12);
+
     switch (index) {
     case 0x40000000:
-        *eax = 0x40000010;    /* Max available cpuid leaf */
-        *ebx = 0;             /* Leave signature empty */
+        *eax = 0x40000010;
+        *ebx = signature[0];
+        *ecx = signature[1];
+        *edx = signature[2];
+        break;
+    case 0x40000001:
+        *eax = (1 << 3) | (1 << 24);
+        *ebx = 0;
         *ecx = 0;
         *edx = 0;
         break;

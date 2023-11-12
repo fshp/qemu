@@ -64,6 +64,8 @@ HVFState *hvf_state;
 #define HV_VM_DEFAULT NULL
 #endif
 
+void update_system_time(CPUX86State *env);
+
 /* Memory slots */
 
 hvf_slot *hvf_find_overlap_slot(uint64_t start, uint64_t size)
@@ -205,6 +207,9 @@ static void do_hvf_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
 {
     if (!cpu->vcpu_dirty) {
         hvf_get_registers(cpu);
+        X86CPU *x86_cpu = X86_CPU(cpu);
+        CPUX86State *env = &x86_cpu->env;
+        update_system_time(env);
         cpu->vcpu_dirty = true;
     }
 }
@@ -433,6 +438,9 @@ static void *hvf_cpu_thread_fn(void *arg)
             }
         }
         qemu_wait_io_event(cpu);
+        // X86CPU *x86_cpu = X86_CPU(cpu);
+        // CPUX86State *env = &x86_cpu->env;
+        // update_system_time(env);
     } while (!cpu->unplug || cpu_can_run(cpu));
 
     hvf_vcpu_destroy(cpu);

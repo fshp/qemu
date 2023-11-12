@@ -44,6 +44,10 @@
 #include "x86_flags.h"
 #include "vmcs.h"
 #include "vmx.h"
+#include "Hypervisor/hv.h"
+
+#define MSR_KVM_WALL_CLOCK_NEW  0x4b564d00
+#define MSR_KVM_SYSTEM_TIME_NEW 0x4b564d01
 
 void hvf_handle_io(struct CPUState *cpu, uint16_t port, void *data,
                    int direction, int size, uint32_t count);
@@ -765,6 +769,193 @@ static void exec_rdmsr(CPUX86State *env, struct x86_decode *decode)
     env->eip += decode->len;
 }
 
+#define do_shl32_div32(n, base)					\
+	({							\
+	    uint32_t __quot, __rem;					\
+	    asm("divl %2" : "=a" (__quot), "=d" (__rem)		\
+			: "rm" (base), "0" (0), "1" ((uint32_t) n));	\
+	    n = __quot;						\
+	    __rem;						\
+	 })
+
+static uint32_t div_frac(uint32_t dividend, uint32_t divisor)
+{
+	do_shl32_div32(dividend, divisor);
+	return dividend;
+}
+
+#include <mach/clock.h>
+#include <mach/mach.h>
+#include <time.h>
+
+static void kvm_get_time_scale(uint64_t scaled_hz, uint64_t base_hz,
+			       int8_t *pshift, uint32_t *pmultiplier)
+{
+	uint64_t scaled64;
+	int32_t  shift = 0;
+	uint64_t tps64;
+	uint32_t tps32;
+
+	tps64 = base_hz;
+	scaled64 = scaled_hz;
+	while (tps64 > scaled64*2 || tps64 & 0xffffffff00000000ULL) {
+		tps64 >>= 1;
+		shift--;
+	}
+
+	tps32 = (uint32_t)tps64;
+	while (tps32 <= scaled64 || scaled64 & 0xffffffff00000000ULL) {
+		if (scaled64 & 0xffffffff00000000ULL || tps32 & 0x80000000)
+			scaled64 >>= 1;
+		else
+			tps32 <<= 1;
+		shift++;
+	}
+
+	*pshift = shift;
+	*pmultiplier = div_frac(scaled64, tps32);
+}
+
+void update_system_time(CPUX86State *env) {
+    fprintf(stderr, "%s: update clock: 0x%llx\n", __func__, env->system_time_msr);
+    if (env->system_time_msr == 0) {
+        return;
+    }
+
+    struct pvclock_vcpu_time_info {
+        uint32_t   version;
+        uint32_t   pad0;
+        uint64_t   tsc_timestamp;
+        uint64_t   system_time;
+        uint32_t   tsc_to_system_mul;
+        int8_t     tsc_shift;
+        uint8_t    flags;
+        uint8_t    pad[2];
+    } __attribute__((__packed__)); /* 32 bytes */
+
+    struct pvclock_vcpu_time_info timer;
+
+    hwaddr kvmclock_struct_pa = env->system_time_msr & ~1ULL;
+
+    cpu_physical_memory_read(kvmclock_struct_pa, &timer, sizeof(struct pvclock_vcpu_time_info));
+
+    fprintf(stderr, "%s: update clock: timer version %u\n", __func__, timer.version);
+    if (timer.version & 1U) {
+        ++timer.version;
+    }
+
+    ++timer.version;
+
+    cpu_physical_memory_write(
+        kvmclock_struct_pa + offsetof(struct pvclock_vcpu_time_info, version),
+        &timer.version,
+        sizeof(timer.version));
+
+    #define NSEC_PER_SEC	1000000000L
+
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
+
+    int8_t shift;
+    uint32_t mul;
+
+    kvm_get_time_scale(NSEC_PER_SEC, env->tsc_khz * 1000LL, &shift, &mul);
+    // kvm_get_time_scale(env->tsc_khz * 1000LL, NSEC_PER_SEC, &shift, &mul);
+
+    timer.tsc_shift = shift;
+    timer.tsc_to_system_mul = mul;
+
+    timer.tsc_timestamp = hv_tsc_clock();
+    timer.system_time = (((uint64_t)time.tv_sec) * ((uint64_t)(NSEC_PER_SEC))) + ((uint64_t)(time.tv_nsec));
+    timer.flags |= 1;
+
+
+    cpu_physical_memory_write(kvmclock_struct_pa, &timer, sizeof(struct pvclock_vcpu_time_info));
+
+    uint32_t ver = timer.version + 1;
+    cpu_physical_memory_write(
+        kvmclock_struct_pa + offsetof(struct pvclock_vcpu_time_info, version),
+        &ver,
+        sizeof(uint32_t));
+
+
+    struct pvclock_vcpu_time_info debug_timer;
+    cpu_physical_memory_read(kvmclock_struct_pa, &debug_timer, sizeof(struct pvclock_vcpu_time_info));
+    fprintf(stderr,
+    "%s: update clock: debug timer"
+    "\nversion: 0x%08"PRIX32
+    "\ntsc_timestamp: 0x%016"PRIX64
+    "\nsystem_time: 0x%016"PRIX64
+    "\ntsc_to_system_mul: 0x%08"PRIX32
+    "\ntsc_shift: %"PRId8
+    "\nflags: 0x%08"PRIX8
+    "\nenv->tsc: 0x%016"PRIX64
+    "\nenv->tsc_khz: %"PRId64
+    "\nhv_tsc_clock(): %"PRIX64
+    "\n"
+
+    
+    ,__func__,
+    debug_timer.version,
+    debug_timer.tsc_timestamp,
+    debug_timer.system_time,
+    debug_timer.tsc_to_system_mul,
+    debug_timer.tsc_shift,
+    debug_timer.flags,
+    env->tsc,
+    env->tsc_khz,
+    hv_tsc_clock()
+    );
+
+}
+
+
+
+void update_wall_clock(CPUX86State *env) {
+    fprintf(stderr, "%s: update wall clock: 0x%llx\n", __func__, env->wall_clock_msr);
+    if (env->wall_clock_msr == 0) {
+        return;
+    }
+
+    struct pvclock_wall_clock {
+        uint32_t version;
+        uint32_t sec;
+        uint32_t nsec;
+    } __attribute__((__packed__));
+
+    struct pvclock_wall_clock wall_clock;
+
+    hwaddr wallclock_struct_pa = env->wall_clock_msr & ~1ULL;
+
+    cpu_physical_memory_read(wallclock_struct_pa, &wall_clock, sizeof(struct pvclock_wall_clock));
+
+    fprintf(stderr, "%s: update wall clock: timer version %u\n", __func__, wall_clock.version);
+    if (!(wall_clock.version & 1UL)) {
+        ++wall_clock.version;
+
+        cpu_physical_memory_write(
+            wallclock_struct_pa + offsetof(struct pvclock_wall_clock, version),
+            &wall_clock.version,
+            sizeof(wall_clock.version));
+    }
+
+
+   struct timespec time;
+   clock_gettime(CLOCK_MONOTONIC, &time);
+
+    wall_clock.sec = time.tv_sec;
+    wall_clock.nsec = time.tv_nsec;
+
+
+    cpu_physical_memory_write(wallclock_struct_pa, &wall_clock, sizeof(struct pvclock_wall_clock));
+
+    ++wall_clock.version;
+    cpu_physical_memory_write(
+        wallclock_struct_pa + offsetof(struct pvclock_wall_clock, version),
+        &wall_clock.version,
+        sizeof(wall_clock.version));
+}
+
 void simulate_wrmsr(struct CPUState *cpu)
 {
     X86CPU *x86_cpu = X86_CPU(cpu);
@@ -773,6 +964,16 @@ void simulate_wrmsr(struct CPUState *cpu)
     uint64_t data = ((uint64_t)EDX(env) << 32) | EAX(env);
 
     switch (msr) {
+    case MSR_KVM_WALL_CLOCK_NEW:
+        env->wall_clock_msr = data;
+        fprintf(stderr, "%s: MSR_KVM_WALL_CLOCK_NEW 0x%x\n", __func__, msr);
+        update_wall_clock(env);
+        break;
+    case MSR_KVM_SYSTEM_TIME_NEW:
+        env->system_time_msr = data;
+        fprintf(stderr, "%s: MSR_KVM_SYSTEM_TIME_NEW 0x%x -> 0x%llx\n", __func__, msr, data);
+        update_system_time(env);
+        break;
     case MSR_IA32_TSC:
         break;
     case MSR_IA32_APICBASE:
@@ -844,6 +1045,7 @@ void simulate_wrmsr(struct CPUState *cpu)
         env->mtrr_deftype = data;
         break;
     default:
+        fprintf(stderr, "%s: Unknown msr 0x%x\n", __func__, msr);
         break;
     }
 
